@@ -6,9 +6,31 @@ from .sparsegpt import SparseGPT
 from .layerwrapper import WrappedGPT
 from .data import get_loaders 
 
-from .ablate import AblateGPT 
+from .ablate import AblateGPT
+from awq.modules.linear import WQLinear_GEMM
+from awq.utils.packing_utils import dequantize_gemm, reverse_awq_order, unpack_awq
 
-def find_layers(module, layers=[nn.Linear], name=''):
+
+def pack_new_weights(layer, fp16_weights):
+    # Unpack 
+    iweight, izeros = unpack_awq(layer.qweight, layer.qzeros, layer.w_bit)
+    
+    # Reorder
+    iweight, izeros = reverse_awq_order(iweight, izeros, layer.w_bit)
+    izeros = torch.bitwise_and(izeros, (2**layer.w_bit) - 1) 
+    
+    duplicate_linear = nn.Linear(layer.in_features, layer.out_features, dtype=torch.float16)
+    duplicate_linear.to(device='cuda') 
+    duplicate_linear.weight = nn.Parameter(fp16_weights)
+    duplicate_gemm = WQLinear_GEMM.from_linear(duplicate_linear, layer.w_bit, layer.group_size, scales=layer.scales, zeros=izeros) 
+    layer.qweight = duplicate_gemm.qweight.clone()
+    del duplicate_gemm
+    del duplicate_linear
+    torch.cuda.empty_cache()
+    return layer
+
+
+def find_layers(module, layers=[nn.Linear, WQLinear_GEMM], name=''):
     """
     Recursively find the layers of a certain type in a module.
 
@@ -33,7 +55,7 @@ def check_sparsity(model):
     use_cache = model.config.use_cache 
     model.config.use_cache = False 
 
-    layers = model.model.layers
+    layers = model.model.model.layers
     count = 0 
     total_params = 0
     for i in range(len(layers)):
@@ -43,7 +65,8 @@ def check_sparsity(model):
         sub_count = 0
         sub_params = 0
         for name in subset:
-            W = subset[name].weight.data
+            layer = subset[name] 
+            W = dequantize_gemm(layer.qweight, layer.qzeros, layer.scales, layer.w_bit, layer.group_size)
             count += (W==0).sum().item()
             total_params += W.numel()
 
@@ -58,11 +81,13 @@ def check_sparsity(model):
 def prepare_calibration_input(model, dataloader, device):
     use_cache = model.config.use_cache
     model.config.use_cache = False
-    layers = model.model.layers
+    import ipdb
+    ipdb.set_trace()
+    layers = model.model.model.layers
 
     # dev = model.hf_device_map["model.embed_tokens"]
-    if "model.embed_tokens" in model.hf_device_map:
-        device = model.hf_device_map["model.embed_tokens"]
+    if "model.embed_tokens" in model.model.hf_device_map:
+        device = model.model.hf_device_map["model.embed_tokens"]
 
     dtype = next(iter(model.parameters())).dtype
     inps = torch.zeros((128, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
@@ -133,19 +158,23 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
     print("dataset loading complete")
     with torch.no_grad():
         inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
-
-    layers = model.model.layers
+    #import ipdb
+    #ipdb.set_trace()
+    model.to(device='cpu')
+    torch.cuda.empty_cache()
+    layers = model.model.model.layers
+     
     for i in range(len(layers)):
-        layer = layers[i]
+        layer = layers[i].to(device='cuda')
         subset = find_layers(layer)
 
-        if f"model.layers.{i}" in model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
+        if f"model.layers.{i}" in model.model.hf_device_map:   ## handle the case for llama-30B and llama-65B, when the device map has multiple GPUs;
             dev = model.hf_device_map[f"model.layers.{i}"]
             inps, outs, attention_mask, position_ids = inps.to(dev), outs.to(dev), attention_mask.to(dev), position_ids.to(dev)
 
         wrapped_layers = {}
         for name in subset:
-            wrapped_layers[name] = WrappedGPT(subset[name])
+            wrapped_layers[name] = WrappedGPT(subset[name], layer_name=name)
 
         def add_batch(name):
             def tmp(_, inp, out):
@@ -155,15 +184,20 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
         handles = []
         for name in wrapped_layers:
             handles.append(subset[name].register_forward_hook(add_batch(name)))
+        #import ipdb
+        #ipdb.set_trace()
         for j in range(args.nsamples):
             with torch.no_grad():
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
         for h in handles:
             h.remove()
-
+        #import ipdb
+        #ipdb.set_trace()
         for name in subset:
             print(f"pruning layer {i} name {name}")
-            W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
+            gemm_layer = subset[name] 
+            fp16_weight = dequantize_gemm(gemm_layer.qweight, gemm_layer.qzeros, gemm_layer.scales, gemm_layer.w_bit, gemm_layer.group_size).T
+            W_metric = torch.abs(fp16_weight) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
 
             W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
             if prune_n != 0:
@@ -199,14 +233,24 @@ def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0
                     indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
                     W_mask.scatter_(1, indices, True)
 
-            subset[name].weight.data[W_mask] = 0  ## set weights to zero 
-
+            fp16_weight[W_mask] = 0  ## set weights to zero 
+            pack_new_weights(gemm_layer, fp16_weight)
+            torch.cuda.empty_cache()
+        print("Executing layer") 
+        #import ipdb
+        #ipdb.set_trace()
         for j in range(args.nsamples):
             with torch.no_grad():
                 outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
         inps, outs = outs, inps
-
+        layer.to('cpu')
+        torch.cuda.empty_cache()
+    del inps, outs 
     model.config.use_cache = use_cache 
+    import ipdb
+    ipdb.set_trace()
+    torch.cuda.empty_cache()
+    model.to('cuda')
     torch.cuda.empty_cache()
 
 
@@ -393,6 +437,6 @@ def prune_ablate(args, model, tokenizer, dev, prune_n=0, prune_m=0):
         torch.cuda.empty_cache()
 
         inps, outs = outs, inps
-
+    del inps
     model.config.use_cache = use_cache
     torch.cuda.empty_cache()

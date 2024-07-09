@@ -4,9 +4,10 @@ import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from importlib.metadata import version
-
+from awq import AutoAWQForCausalLM
 from lib.prune import prune_wanda, prune_magnitude, prune_sparsegpt, prune_ablate, check_sparsity, find_layers
 from lib.eval import eval_ppl, eval_zero_shot
+from prompt_template import PromptTemplate as PT
 
 print('torch', version('torch'))
 print('transformers', version('transformers'))
@@ -14,12 +15,14 @@ print('accelerate', version('accelerate'))
 print('# of gpus: ', torch.cuda.device_count())
 
 def get_llm(model_name, cache_dir="llm_weights"):
-    model = AutoModelForCausalLM.from_pretrained(
+    model = AutoAWQForCausalLM.from_quantized(
         model_name, 
         torch_dtype=torch.float16, 
         cache_dir=cache_dir, 
         low_cpu_mem_usage=True, 
-        device_map="auto"
+        device_map="auto",
+        fuse_layers=False, 
+        attn_implementation='eager',
     )
 
     model.seqlen = model.config.max_position_embeddings 
@@ -62,7 +65,16 @@ def main():
     if "30b" in args.model or "65b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
         device = model.hf_device_map["lm_head"]
     print("use device ", device)
+    import ipdb; ipdb.set_trace()
+    pt = PT(system_prompt="You are a talking car who loves driving in the mountains.")
+    pt.add_user_message("Hello! Who are you?")
+    prompt = pt.build_prompt()
 
+    input_tokens = tokenizer(prompt, return_tensors="pt").to(device='cuda')
+    print("Executing original model") 
+    with torch.inference_mode():
+        orig_tokens = model.generate(**input_tokens, max_new_tokens=50, num_beams=1, do_sample=False)
+    print("Done!") 
     if args.sparsity_ratio != 0:
         print("pruning starts")
         if args.prune_method == "wanda":
@@ -80,8 +92,29 @@ def main():
     print(f"sparsity sanity check {sparsity_ratio:.4f}")
     print("*"*30)
     ################################################################
-    ppl_test = eval_ppl(args, model, tokenizer, device)
-    print(f"wikitext perplexity {ppl_test}")
+    #ppl_test = eval_ppl(args, model, tokenizer, device)
+    #print(f"wikitext perplexity {ppl_test}")
+    print("Executing sparse model")
+    with torch.inference_mode():
+        new_tokens = model.generate(**input_tokens, max_new_tokens=50, num_beams=1, do_sample=False)
+    print("original out: ", tokenizer.batch_decode(orig_tokens)) 
+    print("Sparse model out: ", tokenizer.batch_decode(new_tokens)) 
+    model.to('cpu') 
+    import ipdb
+    ipdb.set_trace()
+    import sys
+    sys.path.append("/mnt/ochougul/efficient-transformers")
+    
+    import QEfficient
+    from QEfficient import QEFFAutoModelForCausalLM
+    from QEfficient.src._quant.awq import repack_transform 
+    model_name="llama-2-7b-chat-awq-50-sparse-wanda"
+    repack_transform(model) 
+    qeff_model = QEFFAutoModelForCausalLM(model)
+    qeff_model.model.to('cpu') 
+    base_path, onnx_model_path = QEfficient.export(model_name=model_name, model_kv=qeff_model, tokenizer=tokenizer)
+    
+    
 
     if not os.path.exists(args.save):
         os.makedirs(args.save)
