@@ -19,7 +19,8 @@ def get_llm(model_name, cache_dir="llm_weights"):
         torch_dtype=torch.float16, 
         cache_dir=cache_dir, 
         low_cpu_mem_usage=True, 
-        device_map="auto"
+        device_map="auto",
+        attn_implementation="eager",
     )
 
     model.seqlen = model.config.max_position_embeddings 
@@ -56,8 +57,21 @@ def main():
     print(f"loading llm model {args.model}")
     model = get_llm(args.model, args.cache_dir)
     model.eval()
+    ################################################################
+    print("Sparsity before WANDA") 
+    print("*"*30)
+    sparsity_ratio = check_sparsity(model)
+    print(f"sparsity sanity check {sparsity_ratio:.4f}")
+    print("*"*30)
+    ################################################################
+    exit() 
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
-
+    print("Execution Samples before sparsifying the model:") 
+    PROMPTS= ["Once upon a time", "My name is", "Hardware and Software", "Review of the book"]
+    for prompt in PROMPTS:
+        inps = tokenizer(prompt, return_tensors='pt').to('cuda')
+        out_tokens = model.generate(**inps, max_new_tokens=128, num_beams=1, do_sample=False)
+        print(prompt, "\n", tokenizer.batch_decode(out_tokens))
     device = torch.device("cuda:0")
     if "30b" in args.model or "65b" in args.model: # for 30b and 65b we use device_map to load onto multiple A6000 GPUs, thus the processing here.
         device = model.hf_device_map["lm_head"]
@@ -80,6 +94,24 @@ def main():
     print(f"sparsity sanity check {sparsity_ratio:.4f}")
     print("*"*30)
     ################################################################
+    print("Execution Samples after sparsifying the model:") 
+    for prompt in PROMPTS:
+        inps = tokenizer(prompt, return_tensors='pt').to('cuda')
+        out_tokens = model.generate(**inps, max_new_tokens=128, num_beams=1, do_sample=False)
+        print(prompt, "\n", tokenizer.batch_decode(out_tokens))
+    exit() 
+    import sys
+    sys.path.append("/mnt/ochougul/efficient-transformers")
+    import QEfficient
+    from QEfficient import QEFFAutoModelForCausalLM
+    model_name="TinyLlama-1.1B-Chat-v1.0-sparse-50"
+    model.to('cpu') 
+    qeff_model = QEFFAutoModelForCausalLM(model)
+    
+    base_path, onnx_model_path = QEfficient.export(model_name=model_name, model_kv=qeff_model, tokenizer=tokenizer)
+    model.to('cuda') 
+    import ipdb
+    ipdb.set_trace()
     ppl_test = eval_ppl(args, model, tokenizer, device)
     print(f"wikitext perplexity {ppl_test}")
 
